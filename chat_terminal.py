@@ -1,4 +1,4 @@
-import requests
+import httpx
 import json
 import asyncio
 import time
@@ -10,13 +10,12 @@ messages = [{'role': 'system', 'content': 'You are SUSI-Chat, a smart and helpfu
 UNWANTED_WORDS = ["[INST]", "<<USER>>", "<USER>", "<<SYS>>", "<<SYS>>\n"]
 
 def get_user_input():
-    return input(">")
+    return input("> ")
 
 last_response_code = -1
 last_response_lines = []
 
 async def generate_response(input_text):
-    # special handling of well-defined input texts
     global last_response_code
     global last_response_lines
     if input_text == "debug":
@@ -25,7 +24,6 @@ async def generate_response(input_text):
         return
 
     if input_text == "reset":
-        # delete all but the first message from the messages list
         del messages[1:]
         print("resetting message history")
         return
@@ -39,73 +37,78 @@ async def generate_response(input_text):
         'stream': True
     }
     last_response_lines = []
-    response = requests.post(f'{API_URL}/v1/chat/completions', json=payload, stream=True)
 
-    last_response_code = response.status_code
+    async def post_request(payload):
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            try:
+                response = await client.post(f'{API_URL}/v1/chat/completions', json=payload)
+                return response
+            except httpx.RequestError as exc:
+                print(f"Network error: {exc}")
+                return None
 
-    # Check if response is not OK and modify messages array if needed
-    if not response.ok and len(messages) > 3:
-        print("pruning message history")
-        # Remove the second and third elements (the first one is the system message)
-        del messages[1:3]
-        # Retry the request
-        response = requests.post(f'{API_URL}/v1/chat/completions', json=payload, stream=True)
+    response = await post_request(payload)
+    last_response_code = response.status_code if response else -1
 
-    # do this a second time in case that the reduction of the context length was not enough
-    if not response.ok and len(messages) > 3:
-        print("pruning message history a second time")
-        del messages[1:3]
-        response = requests.post(f'{API_URL}/v1/chat/completions', json=payload, stream=True)
-    
-    if response.ok:
-        # Store all printed text for unwanted word detection and to store it to the assistant message object
+    # Retry logic for context pruning
+    for prune_attempt in range(2):
+        if (not response or not response.is_success) and len(messages) > 3:
+            print(f"pruning message history{' a second time' if prune_attempt else ''}")
+            del messages[1:3]
+            response = await post_request(payload)
+            last_response_code = response.status_code if response else -1
+        else:
+            break
+
+    if response and response.is_success:
         printed_text = ""
         token_count = 0
         start_time = time.time()
-        
-        for line in response.iter_lines():
-            last_response_lines.append(line)
-            if line:
-                decoded_line = line.decode('utf-8').replace('data: ', '').strip()
-
-                if decoded_line == '[DONE]':
-                    end_time = time.time()
-                    elapsed_time = end_time - start_time
-                    tokens_per_second = token_count / elapsed_time if elapsed_time > 0 else 0
-                    print('\nTokens per second: {:.2f}'.format(tokens_per_second)) 
-                    print('')  # Print a newline at the end
-                    break
-
-                try:
-                    json_data = json.loads(decoded_line)
-                    content = json_data.get('choices', [{}])[0].get('delta', {}).get('content', '')
-                    
-                    if content and ((content != ' ' and content != '\n') or len(printed_text) > 0):
-                        token_count += 1 # one content string is one token
-                        printed_text += content
-                        print(content, end='', flush=True)  # Print content
-                        for unwanted_word in UNWANTED_WORDS:
-                            if printed_text.endswith(unwanted_word):
-                                # Erase the unwanted content
-                                erase_count = len(unwanted_word)
-                                print('\b' * erase_count, end='', flush=True)  # Erase characters
-                                printed_text = printed_text[:-erase_count]
-
-                except json.JSONDecodeError as e:
-                    # do not print anything here, just ignore it. It might happen that the response is just a timestamp line, not json
-                    #print(f"Error parsing JSON: {e}", flush=True)
-                    continue
-
-        # append a message with the assistant content
-        messages.append({"role": "assistant", "content": printed_text})
-        print()
+        # Use httpx streaming for response
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            try:
+                async with client.stream("POST", f'{API_URL}/v1/chat/completions', json=payload) as stream_response:
+                    async for line in stream_response.aiter_lines():
+                        last_response_lines.append(line)
+                        if line:
+                            decoded_line = line.replace('data: ', '').strip()
+                            if decoded_line == '[DONE]':
+                                end_time = time.time()
+                                elapsed_time = end_time - start_time
+                                tokens_per_second = token_count / elapsed_time if elapsed_time > 0 else 0
+                                print(f'\nTokens per second: {tokens_per_second:.2f}\n')
+                                break
+                            try:
+                                json_data = json.loads(decoded_line)
+                                content = json_data.get('choices', [{}])[0].get('delta', {}).get('content', '')
+                                if content and ((content != ' ' and content != '\n') or len(printed_text) > 0):
+                                    token_count += 1
+                                    printed_text += content
+                                    print(content, end='', flush=True)
+                                    for unwanted_word in UNWANTED_WORDS:
+                                        if printed_text.endswith(unwanted_word):
+                                            erase_count = len(unwanted_word)
+                                            print('\b' * erase_count, end='', flush=True)
+                                            printed_text = printed_text[:-erase_count]
+                            except json.JSONDecodeError:
+                                continue
+                messages.append({"role": "assistant", "content": printed_text})
+                print()
+            except httpx.RequestError as exc:
+                print(f"Network error during streaming: {exc}")
+            except Exception as exc:
+                print(f"Unexpected error during streaming: {exc}")
     else:
-        print(f"Error: {response.status_code}", flush=True)
-        
+        print(f"Error: {last_response_code if response else 'No response'}", flush=True)
+
 def main():
-    while True:
-        user_input = get_user_input()
-        asyncio.run(generate_response(user_input))
+    print("Welcome to SUSI-Chat! Type your message or 'reset' to clear history. Press Ctrl+C to exit.")
+    try:
+        while True:
+            user_input = get_user_input()
+            asyncio.run(generate_response(user_input))
+    except KeyboardInterrupt:
+        print("\nExiting SUSI-Chat. Goodbye!")
 
 if __name__ == "__main__":
     main()
